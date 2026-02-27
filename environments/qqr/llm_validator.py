@@ -39,8 +39,6 @@ class LLMValidationResult:
 
     @property
     def total(self) -> float:
-        if not self.tool_info_used:
-            return 0.0
         return self.practicality + self.informativeness + self.logic + self.user_experience
 
     def to_dict(self) -> dict:
@@ -59,7 +57,8 @@ class LLMValidationResult:
 
 
 # Prompt template (Chinese for Chinese travel planning evaluation)
-LLM_VALIDATOR_PROMPT = '''你是旅游规划质量评估专家。请评估以下旅行规划方案的质量。
+LLM_VALIDATOR_PROMPT = '''你是旅游规划质量评估专家。请评估以下旅行规划方案的输出质量。
+注意：工具信息使用已由代码验证，你只需评估规划质量。
 
 === 用户需求 ===
 问题类型: {problem_type}
@@ -72,7 +71,7 @@ LLM_VALIDATOR_PROMPT = '''你是旅游规划质量评估专家。请评估以下
 兴趣: {interests}
 约束: {constraints}
 
-=== 工具调用记录（关键佐证）===
+=== 工具调用记录（参考信息）===
 {tool_trace_formatted}
 
 === 模型输出 (boundary: {boundary_token}) ===
@@ -82,12 +81,7 @@ LLM_VALIDATOR_PROMPT = '''你是旅游规划质量评估专家。请评估以下
 
 === 评估要求 ===
 
-【硬约束: 工具信息利用】
-这是最重要的检查项。对照"工具调用记录"，检查模型输出是否使用了工具返回的信息。
-
-判断标准：
-- TRUE: 模型输出中的关键信息（地点名称、航班/火车信息、路线数据等）**大部分**来自工具返回
-- FALSE: 模型**忽略**了工具返回的结果，自己编造了信息
+请评估以下四个维度的输出质量。
 
 【维度1: 规划可行性 practicality】(0-10分)
 检查规划是否切实可行。
@@ -121,8 +115,6 @@ LLM_VALIDATOR_PROMPT = '''你是旅游规划质量评估专家。请评估以下
 
 ```json
 {{
-  "tool_info_used": <true或false>,
-  "tool_usage_reason": "<说明模型使用/未使用工具信息的具体情况>",
   "practicality": {{"score": <0-10>, "reason": "<说明>"}},
   "informativeness": {{"score": <0-10>, "reason": "<说明>"}},
   "logic": {{"score": <0-10>, "reason": "<说明>"}},
@@ -132,7 +124,7 @@ LLM_VALIDATOR_PROMPT = '''你是旅游规划质量评估专家。请评估以下
 
 
 class LLMValidator:
-    """LLM-based semantic quality evaluator with fallback models and circuit breaker.
+    """LLM-based semantic quality evaluator with fallback models.
 
     All models use Chutes API (same base_url and api_key).
     Fallback order: primary → FALLBACK_MODELS in sequence.
@@ -140,21 +132,20 @@ class LLMValidator:
 
     # Chutes fallback models — tried in order when primary fails
     FALLBACK_MODELS = [
-        "deepseek-ai/DeepSeek-V3-0324",
-        "Qwen/Qwen3-235B-A22B",
+        "Qwen/Qwen3-235B-A22B-Instruct-2507-TEE",
+        "Qwen/Qwen2.5-72B-Instruct",
+        "Qwen/Qwen3-32B",
     ]
 
     def __init__(
         self,
-        model: str = "Qwen/Qwen2.5-72B-Instruct",
+        model: str = "openai/gpt-oss-120b-TEE",
         base_url: str = "https://llm.chutes.ai/v1",
         api_key: Optional[str] = None,
     ):
         self.model = model
         self.api_key = api_key or os.getenv("CHUTES_API_KEY")
         self.client = AsyncOpenAI(base_url=base_url, api_key=self.api_key)
-        self._consecutive_failures = 0
-        self._circuit_open = False
 
     async def validate(
         self,
@@ -162,18 +153,12 @@ class LLMValidator:
         problem: TravelProblem,
         tool_trace: List[Dict],
     ) -> LLMValidationResult:
-        """Execute LLM validation with fallback and circuit breaker."""
+        """Execute LLM validation with fallback models."""
         if not tool_trace:
             return LLMValidationResult(
                 tool_info_used=False,
                 tool_usage_reason="No tools called, cannot verify info source",
                 success=True,
-            )
-
-        if self._circuit_open:
-            return LLMValidationResult(
-                success=False,
-                error=f"Circuit breaker open after {self._consecutive_failures} consecutive failures",
             )
 
         prompt = self._build_prompt(model_output, problem, tool_trace)
@@ -186,19 +171,13 @@ class LLMValidator:
                 self.client, model_name, prompt, retries=retries
             )
             if result.success:
-                self._consecutive_failures = 0
                 return result
             print(f"[LLM_VALIDATOR] {model_name} failed: {result.error}")
 
-        # All failed
-        self._consecutive_failures += 1
-        if self._consecutive_failures >= 3:
-            self._circuit_open = True
-            print(f"[LLM_VALIDATOR] Circuit breaker OPENED after {self._consecutive_failures} failures")
-
+        # All models failed for this evaluation
         return LLMValidationResult(
             success=False,
-            error=f"All {len(models)} models failed (consecutive={self._consecutive_failures})",
+            error=f"All {len(models)} models failed",
         )
 
     async def _try_validate_with_retries(
@@ -219,7 +198,7 @@ class LLMValidator:
                         temperature=0,
                         max_tokens=2000,
                     ),
-                    timeout=30,
+                    timeout=60,
                 )
                 content = response.choices[0].message.content
                 result = self._parse_response(content)
@@ -229,7 +208,7 @@ class LLMValidator:
                 last_error = Exception(f"Parse failed: {result.error}")
                 break
             except asyncio.TimeoutError:
-                last_error = Exception(f"Timeout after 30s")
+                last_error = Exception(f"Timeout after 60s")
                 if attempt < retries:
                     await asyncio.sleep(1)
                     continue
@@ -322,8 +301,6 @@ class LLMValidator:
             "poi_names": [],
             "flights": [],
             "trains": [],
-            "routes": [],
-            "weather": [],
         }
 
         for i, call in enumerate(tool_trace, 1):
@@ -360,7 +337,6 @@ class LLMValidator:
 
             elif name == "weather":
                 lines.append(f"  返回: {text[:200]}...")
-                key_info["weather"].append(text[:100])
 
             else:
                 lines.append(f"  返回: {text[:200]}...")
@@ -394,6 +370,9 @@ class LLMValidator:
     def _parse_response(self, content: str) -> LLMValidationResult:
         """Parse LLM JSON response."""
         result = LLMValidationResult(raw_response=content)
+        # tool_info_used is now code-determined, not parsed from LLM
+        result.tool_info_used = True
+        result.tool_usage_reason = "code-determined"
 
         try:
             json_str = content
@@ -403,10 +382,6 @@ class LLMValidator:
                 json_str = content.split("```")[1].split("```")[0]
 
             data = json.loads(json_str.strip())
-
-            raw_val = data.get("tool_info_used", False)
-            result.tool_info_used = raw_val if isinstance(raw_val, bool) else str(raw_val).lower() == "true"
-            result.tool_usage_reason = data.get("tool_usage_reason", "")
 
             score, reason = self._extract_dimension_score(data.get("practicality", 0))
             result.practicality = min(10, max(0, score))
@@ -429,8 +404,6 @@ class LLMValidator:
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             result.success = False
             result.error = f"Parse failed: {e}"
-            result.tool_info_used = False
-            result.tool_usage_reason = f"LLM response parse failed: {e}"
 
         return result
 
@@ -439,7 +412,7 @@ _default_validator = None
 
 
 def get_llm_validator(
-    model: str = "Qwen/Qwen2.5-72B-Instruct",
+    model: str = "Qwen/Qwen3-32B",
     base_url: str = "https://llm.chutes.ai/v1",
     api_key: Optional[str] = None,
 ) -> LLMValidator:

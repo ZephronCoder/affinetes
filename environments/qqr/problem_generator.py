@@ -19,20 +19,19 @@ multi-dimensional difficulty control, and seasonal validation.
 import random
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from config import (
     MAJOR_CITIES,
     CITY_PAIRS,
     PROBLEM_TYPES,
     REQUIRED_TOOLS_BY_TYPE,
-    DIFFICULTY_LEVELS,
     CONFLICTING_CONSTRAINT_PAIRS,
+    MIN_TRANSPORT_COST,
 )
 from knowledge_graph import (
     get_profile,
     cities_for_food_theme,
-    cities_for_specialty,
     is_season_ok,
     get_all_landmarks,
 )
@@ -141,8 +140,6 @@ INTERCITY_ARRIVAL_CONSTRAINTS = [
     "上午10点前到达", "中午12点前到达", "下午3点前到达",
     "晚上8点前到达", "无时间限制"
 ]
-INTERCITY_BUDGETS = [800, 1000, 1500, 2000, 3000, 5000]
-
 # MultiDay configuration
 MULTIDAY_INTERESTS = [
     "自然风光", "文化历史", "美食探店", "购物血拼", "休闲度假",
@@ -155,8 +152,6 @@ MULTIDAY_CONSTRAINTS = [
     "不乘坐红眼航班", "优先景区免费开放日",
 ]
 MULTIDAY_GROUP_TYPES = ["solo", "couple", "family", "friends", "elderly"]
-MULTIDAY_BUDGETS_PER_DAY = [500, 800, 1000, 1500, 2000]
-MULTIDAY_DAYS = [2, 3, 4, 5]
 
 # Budget levels with per-day ranges (tightened to force harder trade-offs)
 BUDGET_LEVELS = {
@@ -179,10 +174,15 @@ MIN_BUDGET_PER_PERSON_DAY = {
 
 
 def _apply_budget_tightness(budget: int, problem_type: str, num_days: int,
-                            group_size: int, tightness: float) -> int:
-    """Apply constraint tightness to budget with a minimum floor."""
+                            group_size: int, tightness: float,
+                            transport_cost: int = 0) -> int:
+    """Apply constraint tightness to budget with a minimum floor.
+
+    transport_cost: minimum per-person one-way transport cost.
+    """
     budget = int(budget * tightness)
-    min_budget = MIN_BUDGET_PER_PERSON_DAY.get(problem_type, 100) * num_days * max(1, group_size)
+    per_person_day = MIN_BUDGET_PER_PERSON_DAY.get(problem_type, 100)
+    min_budget = per_person_day * num_days * max(1, group_size) + transport_cost * max(1, group_size)
     return max(budget, min_budget)
 
 # FoodTour configuration
@@ -210,6 +210,13 @@ STUDY_THEMES = [
 def _get_month_from_date(travel_date: str) -> int:
     """Extract month from YYYY-MM-DD date string."""
     return int(travel_date.split("-")[1])
+
+
+def _generate_travel_date(task_id: int) -> str:
+    """Generate deterministic travel date from task_id."""
+    base_date = datetime(2025, 3, 1)
+    day_offset = task_id % 365
+    return (base_date + timedelta(days=day_offset)).strftime("%Y-%m-%d")
 
 
 def _pick_season_safe_city(rng: random.Random, candidates: List[str], month: int) -> str:
@@ -300,9 +307,7 @@ class ProblemGenerator:
         origin, destination = city_pair
 
         # Generate date based on task_id
-        base_date = datetime(2025, 3, 1)
-        day_offset = task_id % 365
-        travel_date = (base_date + timedelta(days=day_offset)).strftime("%Y-%m-%d")
+        travel_date = _generate_travel_date(task_id)
 
         # Season check on destination — swap to season-safe pair if needed
         month = _get_month_from_date(travel_date)
@@ -319,7 +324,8 @@ class ProblemGenerator:
         budget_level = rng.choice(list(BUDGET_LEVELS.keys()))
         budget_range = BUDGET_LEVELS[budget_level]
         budget = rng.randint(budget_range[0], budget_range[1])
-        budget = _apply_budget_tightness(budget, "intercity", 1, 1, profile.constraint_tightness)
+        budget = _apply_budget_tightness(budget, "intercity", 1, 1, profile.constraint_tightness,
+                                         transport_cost=MIN_TRANSPORT_COST[distance_type])
 
         # Arrival constraint — time_pressure tightens it
         if profile.time_pressure:
@@ -362,9 +368,7 @@ class ProblemGenerator:
         destination = rng.choice(self.cities)
 
         # Generate date
-        base_date = datetime(2025, 3, 1)
-        day_offset = task_id % 365
-        travel_date = (base_date + timedelta(days=day_offset)).strftime("%Y-%m-%d")
+        travel_date = _generate_travel_date(task_id)
 
         # Season check — re-pick if needed
         month = _get_month_from_date(travel_date)
@@ -438,9 +442,7 @@ class ProblemGenerator:
         origin, destination = city_pair
 
         # Generate date
-        base_date = datetime(2025, 3, 1)
-        day_offset = task_id % 365
-        travel_date = (base_date + timedelta(days=day_offset)).strftime("%Y-%m-%d")
+        travel_date = _generate_travel_date(task_id)
 
         # Season check on destination
         month = _get_month_from_date(travel_date)
@@ -466,7 +468,8 @@ class ProblemGenerator:
         budget_per_day = rng.randint(budget_range[0], budget_range[1])
         transport_budget = rng.choice([1000, 1500, 2000, 3000])
         total_budget = (budget_per_day * num_days + transport_budget) * group_size
-        total_budget = _apply_budget_tightness(total_budget, "hybrid", num_days, group_size, profile.constraint_tightness)
+        total_budget = _apply_budget_tightness(total_budget, "hybrid", num_days, group_size, profile.constraint_tightness,
+                                              transport_cost=MIN_TRANSPORT_COST[distance_type])
 
         # Interests — biased toward city specialties (increased)
         num_interests = rng.randint(3, 5)
@@ -520,9 +523,7 @@ class ProblemGenerator:
         valid_cities = POI_CITY_MAP.get(poi_focus, self.cities)
         destination = rng.choice(valid_cities)
 
-        base_date = datetime(2025, 3, 1)
-        day_offset = task_id % 365
-        travel_date = (base_date + timedelta(days=day_offset)).strftime("%Y-%m-%d")
+        travel_date = _generate_travel_date(task_id)
 
         # Season check — if destination fails, pick different POI from safe cities
         month = _get_month_from_date(travel_date)
@@ -583,9 +584,7 @@ class ProblemGenerator:
             matching_cities = self.cities  # Defensive fallback
         destination = rng.choice(matching_cities)
 
-        base_date = datetime(2025, 3, 1)
-        day_offset = task_id % 365
-        travel_date = (base_date + timedelta(days=day_offset)).strftime("%Y-%m-%d")
+        travel_date = _generate_travel_date(task_id)
 
         # Season check
         month = _get_month_from_date(travel_date)
@@ -646,9 +645,7 @@ class ProblemGenerator:
         city_pair = rng.choice(self.city_pairs[distance_type])
         origin, destination = city_pair
 
-        base_date = datetime(2025, 3, 1)
-        day_offset = task_id % 365
-        travel_date = (base_date + timedelta(days=day_offset)).strftime("%Y-%m-%d")
+        travel_date = _generate_travel_date(task_id)
 
         # Season check
         month = _get_month_from_date(travel_date)
@@ -676,7 +673,8 @@ class ProblemGenerator:
         budget_level = rng.choice(["comfort", "luxury"])
         budget_range = BUDGET_LEVELS[budget_level]
         budget = rng.randint(budget_range[0], budget_range[1]) * num_days
-        budget = _apply_budget_tightness(budget, "business", num_days, 1, profile.constraint_tightness)
+        budget = _apply_budget_tightness(budget, "business", num_days, 1, profile.constraint_tightness,
+                                         transport_cost=MIN_TRANSPORT_COST[distance_type])
 
         interests = [purpose]
         constraints = []
@@ -711,9 +709,7 @@ class ProblemGenerator:
         """Generate family educational trip problem."""
         destination = rng.choice(self.cities)
 
-        base_date = datetime(2025, 3, 1)
-        day_offset = task_id % 365
-        travel_date = (base_date + timedelta(days=day_offset)).strftime("%Y-%m-%d")
+        travel_date = _generate_travel_date(task_id)
 
         # Season check
         month = _get_month_from_date(travel_date)
@@ -818,7 +814,20 @@ class ProblemGenerator:
 
         prompt = "，".join(parts) + "。"
         prompt += "\n\n请帮我：\n"
-        prompt += "1. 查询所有可选的航班和火车车次（列出班次号、时间、价格）\n"
+
+        # Dynamic transport description based on required_tools
+        has_flights = "search_flights" in problem.required_tools
+        has_trains = "search_train_tickets" in problem.required_tools
+        if has_flights and has_trains:
+            transport_desc = "航班和火车车次"
+        elif has_flights:
+            transport_desc = "航班"
+        elif has_trains:
+            transport_desc = "火车车次"
+        else:
+            transport_desc = "交通方式"
+
+        prompt += f"1. 查询所有可选的{transport_desc}（列出班次号、时间、价格）\n"
         prompt += "2. 至少对比3种出行方案，分析各自优劣（时间、价格、舒适度）\n"
         prompt += "3. 推荐最佳方案并详细说明理由\n"
         prompt += "4. 到达后的景点推荐和简要安排建议"

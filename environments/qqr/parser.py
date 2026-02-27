@@ -30,9 +30,6 @@ class ScheduleItem:
     type: str = ""
     activity: str = ""
     cost: float = 0.0
-    tips: str = ""
-    coordinates: str = ""
-
     def to_dict(self) -> dict:
         return {
             "time_start": self.time_start,
@@ -41,8 +38,6 @@ class ScheduleItem:
             "type": self.type,
             "activity": self.activity,
             "cost": self.cost,
-            "tips": self.tips,
-            "coordinates": self.coordinates,
         }
 
 
@@ -99,28 +94,6 @@ class ParsedOutput:
             "parse_success": self.parse_success,
             "parse_errors": self.parse_errors,
         }
-
-    def get_all_locations(self) -> List[str]:
-        """Extract all locations."""
-        locations = []
-        for day in self.daily_plans:
-            for item in day.items:
-                if item.location:
-                    locations.append(item.location)
-        locations.extend(self.mentioned_locations)
-        return list(set(locations))
-
-    def get_total_cost(self) -> float:
-        """Calculate total cost."""
-        cost = sum(
-            item.cost
-            for day in self.daily_plans
-            for item in day.items
-        )
-        if self.recommended_transport:
-            cost += self.recommended_transport.price
-        return cost
-
 
 class OutputParser:
     """Output parser for model responses."""
@@ -252,8 +225,6 @@ class OutputParser:
             type=item_data.get("type", ""),
             activity=item_data.get("activity", item_data.get("description", "")),
             cost=float(item_data.get("cost", item_data.get("price", 0))),
-            tips=item_data.get("tips", ""),
-            coordinates=item_data.get("coordinates", item_data.get("location_coord", "")),
         )
 
     def _parse_time_range(self, time_str: str) -> tuple:

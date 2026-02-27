@@ -6,6 +6,10 @@ Problem types:
 - InterCity: Inter-city transportation planning
 - MultiDay: Multi-day travel planning
 - Hybrid: Combined planning (transportation + itinerary)
+- SinglePOI: Single point-of-interest exploration
+- FoodTour: Food-themed city tour
+- Business: Business trip planning
+- FamilyStudy: Family study/educational trip
 
 Tools:
 - AMap: poi_search, around_search, direction, weather

@@ -12,40 +12,6 @@ CHUTES_API_KEY = os.getenv("CHUTES_API_KEY")
 AMAP_MAPS_API_KEY = os.getenv("AMAP_MAPS_API_KEY")
 PYTHONPATH = os.getenv("PYTHONPATH", "")
 
-# MCP Tool Definitions
-MCP_TOOLS = {
-    "poi_search": {
-        "server": "AMap",
-        "description": "搜索地点信息（景点、酒店、餐厅等POI）",
-        "required": True,
-    },
-    "around_search": {
-        "server": "AMap",
-        "description": "周边搜索（按坐标和半径搜索）",
-        "required": False,
-    },
-    "direction": {
-        "server": "AMap",
-        "description": "路线规划（驾车/步行/骑行/公交）",
-        "required": True,
-    },
-    "weather": {
-        "server": "AMap",
-        "description": "天气预报查询",
-        "required": False,
-    },
-    "search_flights": {
-        "server": "Transport",
-        "description": "航班搜索（确定性算法生成）",
-        "required": False,
-    },
-    "search_train_tickets": {
-        "server": "Transport",
-        "description": "火车票搜索（确定性算法生成）",
-        "required": False,
-    },
-}
-
 # Required tools by problem type
 REQUIRED_TOOLS_BY_TYPE = {
     "intercity": ["poi_search", "direction", "weather", "search_flights", "search_train_tickets"],
@@ -172,15 +138,16 @@ CONFLICTING_CONSTRAINT_PAIRS = [
     ("不乘坐红眼航班", "经济优先"),
 ]
 
-# Difficulty levels
-DIFFICULTY_LEVELS = {
-    1: {"label": "beginner", "min_tools": 2, "max_tools": 3, "max_days": 1},
-    2: {"label": "intermediate", "min_tools": 3, "max_tools": 5, "max_days": 3},
-    3: {"label": "advanced", "min_tools": 5, "max_tools": 6, "max_days": 5},
-}
-
 # Anti-memorization: require minimum info consistency ratio
 INFO_CONSISTENCY_MIN_RATIO = 0.4  # Must use at least 40% of available tool info
+
+# Code-determined tool_info_used thresholds
+# IC/Comp are based on epoch-salted fact overlap — not forgeable
+# Production data: genuine tool use → IC≈25, Comp≈29; fabricated → IC≈0, Comp≈0
+CODE_TOOL_USED_IC_THRESHOLD = 5.0           # Transport types (intercity, hybrid, business)
+CODE_TOOL_USED_COMP_THRESHOLD = 5.0         # Transport types
+CODE_TOOL_USED_IC_THRESHOLD_NONTRANSPORT = 3.0   # Non-transport (fewer verifiable categories)
+CODE_TOOL_USED_COMP_THRESHOLD_NONTRANSPORT = 3.0
 
 # Anti-memorization: require specific POI names from tools
 ENABLE_POI_VERIFICATION = True
@@ -209,16 +176,6 @@ TRANSPORT_GROUNDING_CONFIG = {
     "max_transport_fabrication_ratio": 0.2,  # Max 20% unverified transport claims
 }
 
-# Default LLM scores when validator is unavailable (API failure/timeout)
-# Conservative 50% of max (3.75 per dimension = 15/30 total)
-# Avoids hard-penalizing models when validator is down
-DEFAULT_LLM_SCORES = {
-    "practicality": 3.75,
-    "informativeness": 3.75,
-    "logic": 3.75,
-    "user_experience": 3.75,
-}  # Total: 15/30 when validator unavailable
-
 # Code score weights (max 70) - tool_coverage/validity are gating prerequisites (0 points)
 # All scoring weight on info_consistency + completeness (the hard, grounding-based dimensions)
 CODE_SCORE_WEIGHTS = {
@@ -234,7 +191,6 @@ INFO_CONSISTENCY_RATIO_DIVISOR = 0.6
 
 # Minimum category breadth: if fewer than this many categories matched
 # AND total categories >= MIN_BREADTH_TOTAL, apply 0.5x penalty
-INFO_CONSISTENCY_MIN_BREADTH = 4
 INFO_CONSISTENCY_MIN_BREADTH_TOTAL = 4
 
 # Fabrication penalty (deducted from code score)
@@ -266,7 +222,17 @@ LLM_SCORE_WEIGHTS = {
 # Total scores
 TOTAL_CODE_SCORE = sum(CODE_SCORE_WEIGHTS.values())
 TOTAL_LLM_SCORE = sum(LLM_SCORE_WEIGHTS.values())
-TOTAL_SCORE = TOTAL_CODE_SCORE + TOTAL_LLM_SCORE
+
+# Minimum per-person one-way transport cost estimate by distance category.
+# Based on mock_transport pricing formulas:
+#   K-class train: 0.12 CNY/km, min 30 CNY
+#   D-class train: 0.31 CNY/km
+#   Economy flight: distance * 0.5 * 0.55 + 100
+MIN_TRANSPORT_COST = {
+    "short": 50,    # ~300km K-class ≈ 36 CNY, conservative 50
+    "medium": 150,  # ~800km K-class ≈ 96 CNY, D-class ≈ 137 CNY, conservative 150
+    "long": 300,    # ~2000km K-class ≈ 240 CNY, cheapest flight ≈ 650 CNY, conservative 300
+}
 
 # Evaluation settings
 MAX_TOOL_STEPS = 15
@@ -500,3 +466,23 @@ TOOLS_SCHEMA = [
         }
     }
 ]
+
+# ============================================================================
+# CITY_PAIRS SAFETY ASSERTIONS
+# Prevent future maintainers from adding city pairs with no transport options.
+# ============================================================================
+CITIES_WITHOUT_AIRPORTS = {
+    "苏州", "大理", "乐山", "峨眉山", "都江堰", "平遥",
+    "承德", "秦皇岛", "凤凰古城", "婺源", "阳朔",
+}
+CITIES_WITHOUT_TRAINS = {
+    "九寨沟", "稻城", "腾冲", "凤凰古城",
+}
+
+# Verify: every city in CITY_PAIRS has at least one transport mode
+for _dist, _pairs in CITY_PAIRS.items():
+    for _o, _d in _pairs:
+        assert (_o not in CITIES_WITHOUT_AIRPORTS or _o not in CITIES_WITHOUT_TRAINS), \
+            f"CITY_PAIR ({_o}, {_d}): {_o} has no transport"
+        assert (_d not in CITIES_WITHOUT_AIRPORTS or _d not in CITIES_WITHOUT_TRAINS), \
+            f"CITY_PAIR ({_o}, {_d}): {_d} has no transport"

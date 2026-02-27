@@ -12,7 +12,7 @@ import logging
 import os
 import random
 import time
-from typing import List, Tuple
+from typing import List
 
 from mcp.server.fastmcp import FastMCP
 
@@ -503,12 +503,12 @@ async def search_train_tickets(
     date: str,
     from_city: str,
     to_city: str,
-    from_city_adcode: str,
-    to_city_adcode: str,
-    from_lat: str,
-    from_lon: str,
-    to_lat: str,
-    to_lon: str,
+    from_city_adcode: str = "",
+    to_city_adcode: str = "",
+    from_lat: str = "",
+    from_lon: str = "",
+    to_lat: str = "",
+    to_lon: str = "",
 ) -> str:
     """
     Search train tickets between cities.

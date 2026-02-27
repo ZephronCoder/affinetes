@@ -7,7 +7,7 @@ Score structure (max 100):
   - Soft penalty (multiplier): required_tools_called(0.5x), poi_names_verified(0.7x),
     transport_grounded(0.3x graduated), tool_quality(0.5x)
 - Code score (70): info_consistency(35), completeness(35)
-  - tool_coverage/validity are diagnostic-only (0 weight), gated as tool_quality soft HC
+  - tool_quality soft HC gates on coverage/validity ratios
 - Fabrication penalty: 0 to -17.5 (deducted from code score)
 - LLM score (30): practicality(7.5), informativeness(7.5), logic(7.5), user_experience(7.5)
   - Smooth LLM-code coupling: llm *= min(1.0, code / (max_code * 0.75))
@@ -37,10 +37,8 @@ from config import (
     LLM_SCORE_WEIGHTS,
     REQUIRED_TOOLS_BY_TYPE,
     TOTAL_CODE_SCORE,
-    TOTAL_LLM_SCORE,
     TRANSPORT_TOOLS,
     REQUIRES_TRANSPORT,
-    DEFAULT_LLM_SCORES,
     ENABLE_POI_VERIFICATION,
     MIN_POI_MATCH_COUNT,
     ENABLE_TRANSPORT_GROUNDING,
@@ -49,9 +47,12 @@ from config import (
     FABRICATION_PENALTY_MAX,
     HARD_CONSTRAINT_PENALTIES,
     INFO_CONSISTENCY_RATIO_DIVISOR,
-    INFO_CONSISTENCY_MIN_BREADTH,
     INFO_CONSISTENCY_MIN_BREADTH_TOTAL,
     LLM_CODE_RATIO_FACTOR,
+    CODE_TOOL_USED_IC_THRESHOLD,
+    CODE_TOOL_USED_COMP_THRESHOLD,
+    CODE_TOOL_USED_IC_THRESHOLD_NONTRANSPORT,
+    CODE_TOOL_USED_COMP_THRESHOLD_NONTRANSPORT,
 )
 from parser import ParsedOutput, get_parser
 from problem_generator import TravelProblem
@@ -95,7 +96,6 @@ class TransportGroundingResult:
     total_transport_claims: int = 0
     verified_claims: int = 0
     unverified_claims: int = 0
-    violations: List[str] = field(default_factory=list)
     details: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -106,9 +106,7 @@ class ScoreBreakdown:
 
     hard_constraints: Dict[str, bool] = field(default_factory=dict)
 
-    # Code score (max 70) - tool_coverage/validity are diagnostic only (0 weight)
-    tool_coverage: float = 0.0
-    tool_validity: float = 0.0
+    # Code score (max 70)
     info_consistency: float = 0.0
     completeness: float = 0.0
     fabrication_penalty: float = 0.0
@@ -129,6 +127,9 @@ class ScoreBreakdown:
 
     # Transport grounding details
     transport_grounding_details: Dict[str, Any] = field(default_factory=dict)
+
+    # Cross-validation override diagnostic
+    tool_info_override: str = ""  # "code_overrode_llm_true" / "code_overrode_llm_false" / ""
 
     @property
     def total(self) -> float:
@@ -189,8 +190,6 @@ class ScoreBreakdown:
             "total": self.total,
             "hard_constraints": self.hard_constraints,
             "code_score": {
-                "tool_coverage": self.tool_coverage,
-                "tool_validity": self.tool_validity,
                 "info_consistency": self.info_consistency,
                 "completeness": self.completeness,
                 "fabrication_penalty": self.fabrication_penalty,
@@ -209,7 +208,9 @@ class ScoreBreakdown:
             "parse_errors": self.parse_errors,
             "llm_validation_success": self.llm_validation_success,
             "llm_validation_error": self.llm_validation_error,
+            "llm_available": self.llm_validation_success,
             "transport_grounding": self.transport_grounding_details,
+            "tool_info_override": self.tool_info_override,
         }
 
 
@@ -598,8 +599,6 @@ class TransportGroundingVerifier:
                 result.unverified_claims += len(fabricated)
                 result.details["flights"]["verified"] = list(verified)
                 result.details["flights"]["fabricated"] = list(fabricated)
-                if fabricated:
-                    result.violations.append(f"Fabricated flight IDs: {fabricated}")
             elif "search_flights" in called_tools:
                 # Tool was called but returned empty/error — don't count in totals
                 result.details["flights"]["unverifiable"] = list(output_facts.flights)
@@ -608,7 +607,6 @@ class TransportGroundingVerifier:
                 result.total_transport_claims += len(output_facts.flights)
                 result.unverified_claims += len(output_facts.flights)
                 result.details["flights"]["fabricated"] = list(output_facts.flights)
-                result.violations.append(f"Flight IDs without tool call: {output_facts.flights}")
 
         # Trains
         if output_facts.trains:
@@ -620,8 +618,6 @@ class TransportGroundingVerifier:
                 result.unverified_claims += len(fabricated)
                 result.details["trains"]["verified"] = list(verified)
                 result.details["trains"]["fabricated"] = list(fabricated)
-                if fabricated:
-                    result.violations.append(f"Fabricated train IDs: {fabricated}")
             elif "search_train_tickets" in called_tools:
                 # Tool was called but returned empty/error — don't count in totals
                 result.details["trains"]["unverifiable"] = list(output_facts.trains)
@@ -630,7 +626,6 @@ class TransportGroundingVerifier:
                 result.total_transport_claims += len(output_facts.trains)
                 result.unverified_claims += len(output_facts.trains)
                 result.details["trains"]["fabricated"] = list(output_facts.trains)
-                result.violations.append(f"Train IDs without tool call: {output_facts.trains}")
 
     def _verify_transport_prices(
         self,
@@ -660,9 +655,6 @@ class TransportGroundingVerifier:
                         result.unverified_claims += 1
                         result.details["prices"]["fabricated"].append(
                             f"{transport_id}: {output_price} (expected ~{tool_price})"
-                        )
-                        result.violations.append(
-                            f"Price mismatch for {transport_id}: {output_price} vs {tool_price}"
                         )
                 else:
                     # tool_price <= 0: tool data bug, don't penalize model
@@ -995,81 +987,26 @@ class TravelScorer:
         )
         result.transport_grounding_details = transport_result.details
 
-        # LLM validation
-        if self._llm_validator:
-            llm_result = await self._llm_validator.validate(
-                raw_output, problem, tool_trace
-            )
-            result.llm_validation_success = llm_result.success
-            result.llm_validation_error = llm_result.error
-            result.llm_tool_usage_reason = llm_result.tool_usage_reason
-
-            if not llm_result.success:
-                # API failure (timeout, 503, parse error) — fall back to defaults
-                # Don't hard-fail the entire evaluation because of validator downtime
-                result.hard_constraints["tool_info_used"] = True
-                result.llm_practicality = DEFAULT_LLM_SCORES["practicality"]
-                result.llm_informativeness = DEFAULT_LLM_SCORES["informativeness"]
-                result.llm_logic = DEFAULT_LLM_SCORES["logic"]
-                result.llm_user_experience = DEFAULT_LLM_SCORES["user_experience"]
-            elif not llm_result.tool_info_used:
-                result.hard_constraints["tool_info_used"] = False
-                return result
-            else:
-                result.hard_constraints["tool_info_used"] = True
-                # Scale LLM scores from 0-10 to per-dimension max (0-7.5)
-                result.llm_practicality = llm_result.practicality * LLM_SCORE_WEIGHTS["practicality"] / 10.0
-                result.llm_informativeness = llm_result.informativeness * LLM_SCORE_WEIGHTS["informativeness"] / 10.0
-                result.llm_logic = llm_result.logic * LLM_SCORE_WEIGHTS["logic"] / 10.0
-                result.llm_user_experience = llm_result.user_experience * LLM_SCORE_WEIGHTS["user_experience"] / 10.0
-                result.llm_reasons = llm_result.reasons
-        else:
-            result.hard_constraints["tool_info_used"] = True
-            result.llm_practicality = DEFAULT_LLM_SCORES["practicality"]
-            result.llm_informativeness = DEFAULT_LLM_SCORES["informativeness"]
-            result.llm_logic = DEFAULT_LLM_SCORES["logic"]
-            result.llm_user_experience = DEFAULT_LLM_SCORES["user_experience"]
-
-        # Hard fail for format_valid (output is garbage/off-topic)
-        # Other soft constraints (required_tools, poi_names, transport_grounded)
-        # are handled via penalty multipliers in ScoreBreakdown.total()
-        if not result.hard_constraints.get("format_valid", True):
-            return result
-
+        # 1. ALWAYS compute code scores (info_consistency + completeness)
         called_tools = set(call.get("name", "") for call in tool_trace)
-
-        # Compute tool_coverage/validity as diagnostics (0 weight) + gating prerequisite
-        result.tool_coverage = self._score_tool_coverage(tool_trace, problem)
-        result.tool_validity = self._score_tool_validity(tool_trace)
-
-        # Gate: if normalized coverage or validity < 0.5, apply soft penalty
-        # Normalize to 0-1 range for the gate check (weights are 0, but ratios still computed)
         coverage_ratio = self._compute_tool_coverage_ratio(tool_trace, problem)
         validity_ratio = self._compute_tool_validity_ratio(tool_trace)
-        if coverage_ratio < 0.5 or validity_ratio < 0.5:
-            result.hard_constraints["tool_quality"] = False
-        else:
-            result.hard_constraints["tool_quality"] = True
+        result.hard_constraints["tool_quality"] = (
+            coverage_ratio >= 0.5 and validity_ratio >= 0.5
+        )
 
         result.info_consistency = self._score_info_consistency(
             parsed, tool_trace, tool_facts, output_facts
         )
         result.completeness = self._score_completeness(parsed, problem, tool_facts)
 
-        # Cross-validate: if LLM says tool_info_used but code-based metrics
-        # are extremely low, override LLM's assessment (anti-hack)
-        # Require BOTH info_consistency AND completeness to be below threshold
-        # (single low metric could be due to category mismatch, not fabrication)
-        # Transport types use many data categories → stricter threshold
-        # Non-transport types have fewer matchable categories → more forgiving
-        ic_strict_types = {"intercity", "hybrid", "business"}
-        ic_threshold = 3.0 if problem.problem_type in ic_strict_types else 1.0
-        if (result.hard_constraints.get("tool_info_used") and
-                result.info_consistency < ic_threshold and
-                result.completeness < ic_threshold):
-            result.hard_constraints["tool_info_used"] = False
-            return result
+        # 2. Code-determined tool_info_used (epoch-salted fact overlap, not forgeable)
+        result.hard_constraints["tool_info_used"] = self._determine_tool_info_used(
+            result.info_consistency, result.completeness, problem
+        )
+        result.tool_info_override = "code_determined"
 
+        # 3. Fabrication penalty (always computed)
         penalty, violations = self._claim_verifier.verify_claims(
             tool_facts, output_facts, called_tools
         )
@@ -1088,46 +1025,25 @@ class TravelScorer:
 
         result.fabrication_penalty = max(FABRICATION_PENALTY_MAX, penalty)
 
+        # 4. LLM validation (optional enhancement, not a gate)
+        if self._llm_validator:
+            llm_result = await self._llm_validator.validate(
+                raw_output, problem, tool_trace
+            )
+            result.llm_validation_success = llm_result.success
+            result.llm_validation_error = llm_result.error
+            result.llm_tool_usage_reason = llm_result.tool_usage_reason
+            if llm_result.success:
+                result.llm_practicality = llm_result.practicality * LLM_SCORE_WEIGHTS["practicality"] / 10.0
+                result.llm_informativeness = llm_result.informativeness * LLM_SCORE_WEIGHTS["informativeness"] / 10.0
+                result.llm_logic = llm_result.logic * LLM_SCORE_WEIGHTS["logic"] / 10.0
+                result.llm_user_experience = llm_result.user_experience * LLM_SCORE_WEIGHTS["user_experience"] / 10.0
+                result.llm_reasons = llm_result.reasons
+            # LLM failure: llm_total=0, code 70 pts still valid
+        else:
+            result.llm_validation_error = "LLM validator not configured"
+
         return result
-
-    def _score_tool_coverage(self, tool_trace: List[Dict], problem: TravelProblem) -> float:
-        max_score = CODE_SCORE_WEIGHTS.get("tool_coverage", 17.5)
-        if not tool_trace:
-            return 0.0
-        called_tools = set(call.get("name", "") for call in tool_trace)
-        required_tools = set(problem.required_tools)
-        if not required_tools:
-            return max_score
-        called_required = called_tools & required_tools
-        coverage = len(called_required) / len(required_tools)
-        return round(max_score * coverage, 2)
-
-    def _score_tool_validity(self, tool_trace: List[Dict]) -> float:
-        max_score = CODE_SCORE_WEIGHTS.get("tool_validity", 17.5)
-        if not tool_trace:
-            return 0.0
-
-        valid_calls = 0.0
-        total_calls = len(tool_trace)
-
-        for call in tool_trace:
-            name = call.get("name", "")
-            args = call.get("arguments", {})
-            result = call.get("result", {})
-
-            has_required = self._check_required_args(name, args)
-            arg_score = self._validate_arg_values(name, args)
-            has_valid = self._check_valid_result(result)
-
-            if has_required and has_valid:
-                valid_calls += arg_score
-            elif has_required:
-                valid_calls += 0.5 * arg_score if arg_score > 0.3 else 0.0
-            elif args:
-                valid_calls += 0.2 * arg_score
-
-        validity_rate = valid_calls / total_calls if total_calls > 0 else 0
-        return round(max_score * validity_rate, 2)
 
     def _compute_tool_coverage_ratio(self, tool_trace: List[Dict], problem: TravelProblem) -> float:
         """Compute raw tool coverage ratio (0-1) for gating."""
@@ -1157,6 +1073,27 @@ class TravelScorer:
                 valid_calls += 0.5
         return valid_calls / total_calls if total_calls > 0 else 0.0
 
+    def _determine_tool_info_used(
+        self, ic: float, comp: float, problem: TravelProblem
+    ) -> bool:
+        """Determine tool_info_used purely from code scores.
+
+        Transport types (intercity, hybrid, business) have more verifiable
+        categories (flights, trains) so use higher thresholds.
+        Non-transport types have fewer verifiable categories so use lower thresholds.
+        """
+        transport_types = {"intercity", "hybrid", "business"}
+        if problem.problem_type in transport_types:
+            return (
+                ic >= CODE_TOOL_USED_IC_THRESHOLD
+                and comp >= CODE_TOOL_USED_COMP_THRESHOLD
+            )
+        else:
+            return (
+                ic >= CODE_TOOL_USED_IC_THRESHOLD_NONTRANSPORT
+                and comp >= CODE_TOOL_USED_COMP_THRESHOLD_NONTRANSPORT
+            )
+
     def _check_required_args(self, tool_name: str, args: Dict) -> bool:
         required_args_map = {
             "poi_search": ["address"],
@@ -1168,61 +1105,6 @@ class TravelScorer:
         }
         required = required_args_map.get(tool_name, [])
         return all(arg in args and args[arg] for arg in required)
-
-    def _is_valid_coordinate(self, coord_str: str) -> bool:
-        if not coord_str or not isinstance(coord_str, str):
-            return False
-        match = re.match(r'^([\d.]+)\s*,\s*([\d.]+)$', coord_str.strip())
-        if not match:
-            return False
-        try:
-            lon = float(match.group(1))
-            lat = float(match.group(2))
-            if lon == 0 and lat == 0:
-                return False
-            return 73 <= lon <= 135 and 3 <= lat <= 54
-        except (ValueError, TypeError):
-            return False
-
-    def _validate_arg_values(self, tool_name: str, args: Dict) -> float:
-        if tool_name == "direction":
-            origin_valid = self._is_valid_coordinate(args.get("origin", ""))
-            dest_valid = self._is_valid_coordinate(args.get("destination", ""))
-            if origin_valid and dest_valid:
-                return 1.0
-            elif origin_valid or dest_valid:
-                return 0.5
-            return 0.3
-
-        elif tool_name == "around_search":
-            return 1.0 if self._is_valid_coordinate(args.get("location", "")) else 0.3
-
-        elif tool_name == "weather":
-            city = args.get("city", "")
-            if city and re.match(r'^[\u4e00-\u9fa5]{2,10}$', city):
-                return 1.0
-            return 0.5 if city else 0.0
-
-        elif tool_name in ("search_flights", "search_train_tickets"):
-            date = args.get("date", "")
-            date_score = 1.0 if re.match(r'^\d{4}-\d{2}-\d{2}$', date) else 0.1
-            city_score = 0.0
-            city_count = 0
-            for city in (args.get("from_city", ""), args.get("to_city", "")):
-                if city:
-                    city_count += 1
-                    city_score += 1.0 if re.match(r'^[\u4e00-\u9fa5]{2,10}$', city) else 0.5
-            if city_count == 0:
-                return date_score * 0.3
-            return date_score * 0.5 + (city_score / city_count) * 0.5
-
-        elif tool_name == "poi_search":
-            address = args.get("address", "")
-            if not address or len(address) < 2:
-                return 0.3
-            return 1.0 if re.search(r'[\u4e00-\u9fa5]', address) else 0.5
-
-        return 1.0
 
     def _check_valid_result(self, result: Any) -> bool:
         if not result:
@@ -1252,7 +1134,7 @@ class TravelScorer:
         tool_facts: ExtractedFacts, output_facts: ExtractedFacts
     ) -> float:
         max_score = CODE_SCORE_WEIGHTS.get("info_consistency", 35.0)
-        divisor = INFO_CONSISTENCY_RATIO_DIVISOR  # 0.5 — requires 50% overlap for full category score
+        divisor = INFO_CONSISTENCY_RATIO_DIVISOR  # 0.6 — requires 60% overlap for full category score
         if not tool_trace:
             return 0.0
         if tool_facts.is_empty():
@@ -1532,6 +1414,14 @@ class TravelScorer:
         }
         return targets.get(problem.problem_type, {})
 
+    def _compute_day_grounding(self, output_text: str, tool_facts: ExtractedFacts, num_days: int) -> float:
+        """Compute graduated day grounding based on POI count in output."""
+        if tool_facts.pois:
+            poi_in_days = sum(1 for p in tool_facts.pois if p and p.lower() in output_text)
+            target_pois = min(4, max(2, num_days))
+            return 0.3 + 0.7 * min(1.0, poi_in_days / target_pois)
+        return 0.3
+
     def _score_completeness(self, parsed: ParsedOutput, problem: TravelProblem, tool_facts: ExtractedFacts) -> float:
         max_score = CODE_SCORE_WEIGHTS.get("completeness", 35.0)
         score = 0.0
@@ -1556,14 +1446,8 @@ class TravelScorer:
             # day structure (7) + attractions (7) + dining (6) + lodging (5) + transport (5) + budget (5) = 35
             days = self._count_days_mentioned(parsed.raw_text)
             day_ratio = min(1.0, days / max(1, problem.num_days))
-            # Day structure: graduated grounding based on POI count
             if day_ratio > 0:
-                if tool_facts.pois:
-                    poi_in_days = sum(1 for p in tool_facts.pois if p and p.lower() in output_text)
-                    target_pois = min(4, max(2, problem.num_days))
-                    day_grounding = 0.3 + 0.7 * min(1.0, poi_in_days / target_pois)
-                else:
-                    day_grounding = 0.3
+                day_grounding = self._compute_day_grounding(output_text, tool_facts, problem.num_days)
                 score += 7.0 * day_ratio * day_grounding
             score += self._check_with_grounded_context(output_text, r'(景点|游览|参观)', r'[\u4e00-\u9fa5]{2,}(景区|公园|博物馆|古镇|广场|寺|庙|塔|楼|湖|山)', tool_facts.pois, 7.0, use_fuzzy=True, target_count=targets.get("pois", 0))
             score += self._check_with_grounded_context(output_text, r'(餐|吃|美食)', r'[\u4e00-\u9fa5]{2,}(餐厅|饭店|小吃|菜|面|粉|饭)', tool_facts.pois, 6.0, use_fuzzy=True, target_count=targets.get("dining", 0))
@@ -1579,13 +1463,7 @@ class TravelScorer:
             days = self._count_days_mentioned(parsed.raw_text)
             if days > 0:
                 day_ratio = min(1.0, days / max(1, problem.num_days))
-                # Graduated day grounding based on POI count
-                if tool_facts.pois:
-                    poi_in_days = sum(1 for p in tool_facts.pois if p and p.lower() in output_text)
-                    target_pois = min(4, max(2, problem.num_days))
-                    day_grounding = 0.3 + 0.7 * min(1.0, poi_in_days / target_pois)
-                else:
-                    day_grounding = 0.3
+                day_grounding = self._compute_day_grounding(output_text, tool_facts, problem.num_days)
                 score += 7.0 * day_ratio * day_grounding
             score += self._check_with_grounded_context(output_text, r'(景点|游览)', r'[\u4e00-\u9fa5]{2,}(景区|公园|博物馆|古镇|广场|寺|庙)', tool_facts.pois, 6.0, use_fuzzy=True, target_count=targets.get("pois", 0))
             score += self._check_with_grounded_context(output_text, r'(餐|吃)', r'[\u4e00-\u9fa5]{2,}(餐厅|饭店|小吃|菜)', tool_facts.pois, 5.0, use_fuzzy=True, target_count=targets.get("dining", 0))
@@ -1626,13 +1504,7 @@ class TravelScorer:
             days = self._count_days_mentioned(parsed.raw_text)
             if days > 0:
                 day_ratio = min(1.0, days / max(1, problem.num_days))
-                # Graduated day grounding based on POI count
-                if tool_facts.pois:
-                    poi_in_days = sum(1 for p in tool_facts.pois if p and p.lower() in output_text)
-                    target_pois = min(4, max(2, problem.num_days))
-                    day_grounding = 0.3 + 0.7 * min(1.0, poi_in_days / target_pois)
-                else:
-                    day_grounding = 0.3
+                day_grounding = self._compute_day_grounding(output_text, tool_facts, problem.num_days)
                 score += 7.0 * day_ratio * day_grounding
             score += self._check_with_grounded_context(output_text, r'(亲子|儿童|孩子)', r'(适合|体力|休息|互动)', tool_facts.pois, 7.0, use_fuzzy=True, target_count=targets.get("child_items", 0))
             score += self._check_with_grounded_context(output_text, r'(学习|教育|体验)', r'[\u4e00-\u9fa5]{2,}(馆|园|基地|中心)', tool_facts.pois, 7.0, use_fuzzy=True, target_count=targets.get("education", 0))

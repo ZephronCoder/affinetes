@@ -29,11 +29,9 @@ CACHE_DIR = os.getenv("QQR_CACHE_DIR", "/var/lib/qqr/cache")
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "MCPServerStdio",
     "MCPServerStdioParams",
     "MCPServerStdioCacheable",
     "MCPState",
-    "get_mcp_tools",
 ]
 
 
@@ -210,13 +208,12 @@ class MCPState(metaclass=SingletonMeta):
             self.tools = []
             self.tool_to_server = {}
 
-    @classmethod
-    def reset_singleton(cls):
-        """Remove singleton instance so next __call__ creates a fresh one."""
-        SingletonMeta._instances.pop(cls, None)
-
     async def call_tool(self, tool_call: dict) -> dict:
-        """Call a tool by name with arguments."""
+        """Call a tool by name with arguments. Auto-retries on subprocess crash."""
+        return await self._call_tool_inner(tool_call, allow_retry=True)
+
+    async def _call_tool_inner(self, tool_call: dict, allow_retry: bool) -> dict:
+        """Inner implementation of call_tool with optional crash recovery."""
         await self.get_mcp_servers()
 
         tool_name = tool_call["function"]["name"]
@@ -249,7 +246,25 @@ class MCPState(metaclass=SingletonMeta):
                 tool_content = "[]"
         except json.JSONDecodeError as e:
             tool_content = f"[Error] Invalid JSON arguments: {e}"
+        except (ConnectionError, BrokenPipeError, OSError) as e:
+            if allow_retry:
+                logger.warning("MCP subprocess connection lost (%s), resetting and retrying", e)
+                async with self._mcp_lock:
+                    self._mcp_servers = None
+                    self.tools = []
+                    self.tool_to_server = {}
+                return await self._call_tool_inner(tool_call, allow_retry=False)
+            tool_content = f"[Error] MCP connection failed after retry: {e}"
         except Exception as e:
+            # Check if the exception message indicates a connection-type error
+            err_msg = str(e).lower()
+            if allow_retry and any(kw in err_msg for kw in ("broken pipe", "connection", "eof", "transport")):
+                logger.warning("MCP subprocess likely crashed (%s), resetting and retrying", e)
+                async with self._mcp_lock:
+                    self._mcp_servers = None
+                    self.tools = []
+                    self.tool_to_server = {}
+                return await self._call_tool_inner(tool_call, allow_retry=False)
             tool_content = f"[Error] Tool execution failed: {e}"
 
         return {

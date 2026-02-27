@@ -18,6 +18,7 @@ Scoring structure:
 import asyncio
 import gc
 import json
+import logging
 import os
 import random
 import re
@@ -28,6 +29,8 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 # ==================== Reuse QQR's MCP System ====================
 # Import from mcp_wrapper (copied from QQR to avoid slime dependency)
@@ -70,6 +73,13 @@ def mcp_server_config_fn() -> list:
             "PYTHONPATH": PYTHONPATH or "",
         },
     )
+    # AMap cache TTL aligned to TRANSPORT_SALT epoch boundary.
+    # Ensures AMap data stays stable within the same scoring epoch (week).
+    _SECONDS_PER_WEEK = 7 * 86400
+    _now = int(time.time())
+    _epoch_start = _now // _SECONDS_PER_WEEK * _SECONDS_PER_WEEK
+    _amap_cache_ttl = max(86400, _epoch_start + _SECONDS_PER_WEEK - _now)
+
     amap_server = MCPServerStdioCacheable(
         name="AMap",
         params=amap_server_params,
@@ -77,7 +87,7 @@ def mcp_server_config_fn() -> list:
         client_session_timeout_seconds=60,
         max_retry_attempts=3,
         blocklist=[],
-        cache_ttl=172800,
+        cache_ttl=_amap_cache_ttl,
         cache_maxsize=32768,
         concurrency_limit=16,
     )
@@ -112,10 +122,6 @@ def mcp_server_config_fn() -> list:
 # ==================== Step Reward Calculator ====================
 class StepRewardCalculator:
     """Calculate intermediate rewards after each tool call step."""
-
-    # Tools that are appropriate at different stages
-    EARLY_TOOLS = {"poi_search", "weather", "search_flights", "search_train_tickets"}
-    MID_TOOLS = {"around_search", "direction"}
 
     @staticmethod
     def calculate_step_reward(
@@ -264,7 +270,7 @@ class Actor:
     def __init__(
         self,
         enable_llm_validator: bool = True,
-        llm_validator_model: str = "Qwen/Qwen2.5-72B-Instruct",
+        llm_validator_model: str = "openai/gpt-oss-120b-TEE",
     ):
         self._episodes: Dict[str, EpisodeState] = {}
         self._generator = get_generator()
@@ -275,7 +281,21 @@ class Actor:
         self._mcp_state = MCPState(mcp_server_config_fn)
         self._mcp_initialized = False
 
-        # LLM Validator with fallback models and circuit breaker
+        # ==================== Production Hardening ====================
+        # Shared HTTP client — reuse connection pool across evaluations
+        self._http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(360.0, connect=30.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+        # Protect lazy initialization of _llm_validator from concurrent access
+        self._init_lock = asyncio.Lock()
+        # Limit max concurrent evaluations to prevent resource exhaustion
+        self._eval_semaphore = asyncio.Semaphore(20)
+        # Periodic GC: trigger gc.collect() every _gc_interval evaluations
+        self._eval_count = 0
+        self._gc_interval = 20
+
+        # LLM Validator with fallback models
         self._llm_validator = None
         if enable_llm_validator:
             api_key = os.getenv("CHUTES_API_KEY")
@@ -362,7 +382,7 @@ class Actor:
         ep.current_step += 1
 
         # If tool calls exist, execute using MCPState
-        print(f"[DEBUG] step: tool_calls={len(tool_calls) if tool_calls else 0}, current_step={ep.current_step}, MAX={MAX_TOOL_STEPS}")
+        logger.debug("step: tool_calls=%d, current_step=%d, MAX=%d", len(tool_calls) if tool_calls else 0, ep.current_step, MAX_TOOL_STEPS)
         if tool_calls and ep.current_step <= MAX_TOOL_STEPS:
             # Chutes API workaround: Convert assistant's tool_calls to text format
             # because Chutes API doesn't support OpenAI's tool_calls format
@@ -380,7 +400,7 @@ class Actor:
                 assistant_content += "正在调用以下工具:\n" + "\n".join(tool_call_descriptions)
 
             ep.conversation.append({"role": "assistant", "content": assistant_content})
-            print(f"[DEBUG] Assistant message (tool calls converted to text)")
+            logger.debug("Assistant message (tool calls converted to text)")
         else:
             # No tool calls, add assistant message directly
             ep.conversation.append({"role": "assistant", "content": action or ""})
@@ -410,12 +430,18 @@ class Actor:
                     },
                 }
 
-                # Call MCPState.call_tool
+                # Call MCPState.call_tool (with timeout to prevent hung subprocesses)
                 try:
-                    tool_response = await self._mcp_state.call_tool(tool_call_dict)
+                    tool_response = await asyncio.wait_for(
+                        self._mcp_state.call_tool(tool_call_dict),
+                        timeout=120,
+                    )
                     result_content = tool_response.get("content", "")
+                except asyncio.TimeoutError:
+                    logger.error("Tool call %s timed out after 120s", name)
+                    result_content = f"工具调用超时: {name} 超过120秒未响应"
                 except Exception as e:
-                    print(f"[ERROR] Tool call {name} failed: {e}")
+                    logger.error("Tool call %s failed: %s", name, e)
                     result_content = f"工具调用失败: {str(e)[:200]}"
 
                 # Record tool call
@@ -488,19 +514,29 @@ class Actor:
             # evaluate() ensures this is a complete answer via the
             # dedicated final-answer phase, so no fallback needed.
             scoring_input = action or ""
-            print(f"[DEBUG] scoring_input: len={len(scoring_input)}")
+            logger.debug("scoring_input: len=%d", len(scoring_input))
 
             try:
                 score_result = await self._scorer.score(
                     scoring_input, ep.problem, ep.tool_trace
                 )
-                ep.final_score = score_result.total
                 ep.score_breakdown = score_result.to_dict()
-                print(f"[DEBUG] Scoring completed: total={score_result.total}, breakdown={ep.score_breakdown}")
+
+                if score_result.llm_validation_error:
+                    # LLM validator unavailable after all retries/fallbacks.
+                    # Code scores are computed and available in breakdown for
+                    # diagnostics, but evaluation is marked invalid for fairness:
+                    # comparing scores with/without LLM 30-pt bonus is unfair.
+                    ep.final_score = score_result.total
+                    ep.score_breakdown["error"] = (
+                        f"LLM validator unavailable: {score_result.llm_validation_error}"
+                    )
+                else:
+                    ep.final_score = score_result.total
+
+                logger.debug("Scoring completed: total=%s, breakdown=%s", ep.final_score, ep.score_breakdown)
             except Exception as e:
-                print(f"[ERROR] Scoring failed: {e}")
-                import traceback
-                traceback.print_exc()
+                logger.error("Scoring failed: %s", e, exc_info=True)
                 ep.final_score = 0.0
                 ep.score_breakdown = {"error": str(e)}
 
@@ -541,23 +577,28 @@ class Actor:
 
         # Lazy-init LLM validator when api_key arrives via evaluate() param
         if api_key and not self._llm_validator:
-            self._llm_validator = LLMValidator(
-                model=self._llm_validator_model,
-                base_url="https://llm.chutes.ai/v1",
-                api_key=api_key,
-            )
-            self._scorer = TravelScorer(llm_validator=self._llm_validator)
+            async with self._init_lock:
+                # Double-check after acquiring lock
+                if not self._llm_validator:
+                    self._llm_validator = LLMValidator(
+                        model=self._llm_validator_model,
+                        base_url="https://llm.chutes.ai/v1",
+                        api_key=api_key,
+                    )
+                    self._scorer = TravelScorer(llm_validator=self._llm_validator)
 
-        reset_resp = await self.reset(task_id=task_id, seed=seed)
-        episode_id = reset_resp.episode_id
-        ep = self._episodes[episode_id]
+        episode_id = None  # guard: ensure defined before try/finally
+        async with self._eval_semaphore:
+            reset_resp = await self.reset(task_id=task_id, seed=seed)
+            episode_id = reset_resp.episode_id
+            ep = self._episodes[episode_id]
 
-        total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
-        final_content = None
-        llm_failed = False
+            total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+            final_content = None
+            llm_failed = False
 
-        try:
-            async with httpx.AsyncClient(timeout=float(timeout)) as client:
+            try:
+                client = self._http_client
                 # ===== Phase 1: Tool-calling loop =====
                 for _ in range(MAX_TOOL_STEPS + 2):
                     response = await self._call_llm(
@@ -572,25 +613,25 @@ class Actor:
                     )
 
                     if response is None:
-                        print(f"[DEBUG] LLM returned None in tool-calling phase")
+                        logger.debug("LLM returned None in tool-calling phase")
                         llm_failed = True
                         break
 
                     content = response.get("content") or ""
                     tool_calls = response.get("tool_calls")
                     usage = response.get("usage", {})
-                    print(f"[DEBUG] LLM response: content_len={len(content)}, tool_calls={len(tool_calls) if tool_calls else 0}")
+                    logger.debug("LLM response: content_len=%d, tool_calls=%d", len(content), len(tool_calls) if tool_calls else 0)
 
                     if usage:
                         total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
                         total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
 
                     if tool_calls:
-                        print(f"[DEBUG] tool_calls sample: {tool_calls[0]}")
+                        logger.debug("tool_calls sample: %s", tool_calls[0])
                         # Check if we'd exceed MAX_TOOL_STEPS — if so, stop
                         # tool-calling and move to Phase 2 for a proper final answer
                         if ep.current_step >= MAX_TOOL_STEPS:
-                            print(f"[DEBUG] MAX_TOOL_STEPS reached ({ep.current_step}), ending tool phase")
+                            logger.debug("MAX_TOOL_STEPS reached (%d), ending tool phase", ep.current_step)
                             final_content = content
                             break
                         # Execute tools via step() — returns done=False
@@ -602,17 +643,16 @@ class Actor:
                     else:
                         # Model stopped calling tools — this is its natural answer
                         final_content = content
-                        print(f"[DEBUG] Model gave natural answer: len={len(content)}")
+                        logger.debug("Model gave natural answer: len=%d", len(content))
                         break
 
                 # ===== Phase 2: Ensure a complete final answer =====
-                ep_check = self._episodes.get(episode_id)
-                if ep_check and not ep_check.done:
+                if ep and not ep.done:
                     if llm_failed and final_content is None:
                         # LLM failed — retry up to 3 times with increasing delay
                         for retry_i in range(3):
                             wait_secs = 2 ** retry_i  # 1, 2, 4 seconds
-                            print(f"[DEBUG] Retrying LLM call ({retry_i+1}/3) after {wait_secs}s wait")
+                            logger.debug("Retrying LLM call (%d/3) after %ds wait", retry_i+1, wait_secs)
                             await asyncio.sleep(wait_secs)
                             response = await self._call_llm(
                                 client=client,
@@ -641,7 +681,7 @@ class Actor:
                     if not self._is_substantive_answer(final_content, ep.problem):
                         # Answer is not complete — explicitly request final answer
                         # with tools=None so the model MUST produce text
-                        print(f"[DEBUG] Answer not substantive (len={len(final_content or '')}), requesting final answer")
+                        logger.debug("Answer not substantive (len=%d), requesting final answer", len(final_content or ''))
                         prompt = self._build_final_answer_prompt(ep.problem)
                         ep.conversation.append({"role": "user", "content": prompt})
 
@@ -661,9 +701,9 @@ class Actor:
                             if usage:
                                 total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
                                 total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
-                            print(f"[DEBUG] Got final answer via explicit request: len={len(final_content)}")
+                            logger.debug("Got final answer via explicit request: len=%d", len(final_content))
                         else:
-                            print(f"[DEBUG] Final answer request also failed")
+                            logger.debug("Final answer request also failed")
 
                     # Phase 3: Score with the final answer
                     step_resp = await self.step(
@@ -672,60 +712,56 @@ class Actor:
                         tool_calls=None,
                     )
 
-            final_ep = self._episodes.get(episode_id)
-            if not final_ep:
-                return {
+                final_ep = self._episodes.get(episode_id)
+                if not final_ep:
+                    return {
+                        "task_name": "qqr",
+                        "score": 0.0,
+                        "success": False,
+                        "time_taken": (datetime.now() - start_time).total_seconds(),
+                        "extra": {"error": "episode not found", "seed": seed, "task_id": task_id},
+                    }
+
+                score = final_ep.final_score
+
+                # Build result with truncated conversation to reduce memory
+                # Keep only first 2 messages (system + user prompt) and last 2 messages
+                conv = final_ep.conversation
+                if len(conv) > 6:
+                    truncated_conv = conv[:2] + [{"role": "system", "content": f"... {len(conv) - 4} messages omitted ..."}] + conv[-2:]
+                else:
+                    truncated_conv = conv
+
+                result = {
                     "task_name": "qqr",
-                    "score": 0.0,
-                    "success": False,
+                    "score": score / 100.0,
+                    "success": score >= 60,
                     "time_taken": (datetime.now() - start_time).total_seconds(),
-                    "extra": {"error": "episode not found", "seed": seed, "task_id": task_id},
+                    "extra": {
+                        "conversation": truncated_conv,
+                        "conversation_total_messages": len(conv),
+                        "tool_trace": final_ep.tool_trace,
+                        "seed": seed,
+                        "task_id": task_id,
+                        "usage": total_usage,
+                        "score_raw": score,
+                        "score_breakdown": final_ep.score_breakdown,
+                        "problem": final_ep.problem.to_dict(),
+                        "step_rewards": final_ep.step_rewards,
+                        "avg_step_reward": (
+                            sum(final_ep.step_rewards) / len(final_ep.step_rewards)
+                            if final_ep.step_rewards else 0.0
+                        ),
+                    },
                 }
+                return result
 
-            score = final_ep.final_score
-
-            # Build result with truncated conversation to reduce memory
-            # Keep only first 2 messages (system + user prompt) and last 2 messages
-            conv = final_ep.conversation
-            if len(conv) > 6:
-                truncated_conv = conv[:2] + [{"role": "system", "content": f"... {len(conv) - 4} messages omitted ..."}] + conv[-2:]
-            else:
-                truncated_conv = conv
-
-            result = {
-                "task_name": "qqr",
-                "score": score / 100.0,
-                "success": score >= 60,
-                "time_taken": (datetime.now() - start_time).total_seconds(),
-                "extra": {
-                    "conversation": truncated_conv,
-                    "conversation_total_messages": len(conv),
-                    "tool_trace": final_ep.tool_trace,
-                    "seed": seed,
-                    "task_id": task_id,
-                    "usage": total_usage,
-                    "score_raw": score,
-                    "score_breakdown": final_ep.score_breakdown,
-                    "problem": final_ep.problem.to_dict(),
-                    "step_rewards": final_ep.step_rewards,
-                    "avg_step_reward": (
-                        sum(final_ep.step_rewards) / len(final_ep.step_rewards)
-                        if final_ep.step_rewards else 0.0
-                    ),
-                },
-            }
-            return result
-
-        finally:
-            # Clean up episode and MCP connections to prevent memory leaks
-            self._episodes.pop(episode_id, None)
-            if self._mcp_state:
-                try:
-                    await self._mcp_state.cleanup()
-                except BaseException as e:
-                    print(f"[DEBUG] MCP cleanup error (ignored): {e}")
-                self._mcp_initialized = False
-            gc.collect()
+            finally:
+                if episode_id is not None:
+                    self._episodes.pop(episode_id, None)
+                self._eval_count += 1
+                if self._eval_count % self._gc_interval == 0:
+                    gc.collect()
 
     def _is_substantive_answer(self, content: Optional[str], problem: TravelProblem) -> bool:
         """Check if content is a substantive final answer worth scoring."""
@@ -901,12 +937,7 @@ class Actor:
                 payload["tools"] = tools
                 payload["tool_choice"] = "auto"
 
-            print(f"[DEBUG] Sending messages count: {len(messages)}")
-            # Print messages that contain tool_calls or are tool role
-            for i, msg in enumerate(messages):
-                role = msg.get('role')
-                if role == 'tool' or 'tool_calls' in msg:
-                    print(f"[DEBUG] msg[{i}] = {json.dumps(msg, ensure_ascii=False)[:300]}")
+            logger.debug("Sending messages count: %d", len(messages))
 
             resp = await client.post(
                 f"{base_url}/chat/completions",
@@ -916,9 +947,9 @@ class Actor:
             )
 
             if resp.status_code != 200:
-                print(f"[DEBUG] LLM API Error: {resp.status_code} - {resp.text[:500]}")
+                logger.debug("LLM API Error: %d - %s", resp.status_code, resp.text[:500])
                 return None
-            print(f"[DEBUG] LLM API success, parsing response")
+            logger.debug("LLM API success, parsing response")
 
             data = resp.json()
             choice = data.get("choices", [{}])[0]
@@ -931,9 +962,7 @@ class Actor:
             }
 
         except Exception as e:
-            import traceback
-            print(f"[DEBUG] LLM API Exception: {e}")
-            traceback.print_exc()
+            logger.error("LLM API Exception: %s", e, exc_info=True)
             return None
 
     def _format_tool_results(self, results: List[Dict]) -> str:
@@ -943,15 +972,35 @@ class Actor:
             for r in results
         )
 
+    async def get_memory_stats(self) -> Dict[str, Any]:
+        """Return container memory stats from /proc/self/status."""
+        rss_kb = 0
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        rss_kb = int(line.split()[1])
+                        break
+        except OSError:
+            pass
+        return {
+            "rss_mb": round(rss_kb / 1024, 1),
+            "episodes_active": len(self._episodes),
+            "eval_count": self._eval_count,
+        }
+
     async def cleanup(self):
-        """Clean up resources — close MCP servers and release memory."""
+        """Clean up resources — close MCP servers, HTTP client, and release memory."""
         # Clear any lingering episodes
         self._episodes.clear()
+        # Close shared HTTP client
+        if self._http_client:
+            await self._http_client.aclose()
         # Shut down MCP servers
         if self._mcp_state:
             try:
                 await self._mcp_state.cleanup()
             except Exception as e:
-                print(f"[WARN] MCPState cleanup error: {e}")
+                logger.warning("MCPState cleanup error: %s", e)
             self._mcp_initialized = False
         gc.collect()
