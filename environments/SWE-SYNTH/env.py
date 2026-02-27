@@ -1183,7 +1183,7 @@ fi
         self,
         task_id: Union[int, str],
         # Fixer model config
-        model: str = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8-TEE",
+        model: str = "affine/Kimi-K2.5",
         base_url: str = "https://llm.chutes.ai/v1",
         api_key: Optional[str] = None,
         # Agent type override (None = auto-select)
