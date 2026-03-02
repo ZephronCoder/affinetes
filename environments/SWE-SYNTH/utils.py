@@ -2,6 +2,8 @@
 Shared utilities for SWE-SYNTH environment.
 """
 
+import re
+
 # Source code file extensions for git diff
 # Used to filter out non-code files when extracting patches
 DIFF_EXTENSIONS = (
@@ -27,3 +29,29 @@ git reflog expire --expire=now --all 2>/dev/null || true
 git gc --prune=now 2>/dev/null || true
 echo "Git history sanitized"
 """
+
+# Normalize all file timestamps to the same value to prevent fingerprinting via mtime
+NORMALIZE_TIMESTAMPS_SCRIPT = """
+cd /app
+find . -not -path './.git/*' -exec touch -t 202001010000 {} + 2>/dev/null || true
+echo "Timestamps normalized"
+"""
+
+# Regex patterns for commands that fingerprint the codebase instead of solving the task
+_BLACKLISTED_PATTERNS = [
+    re.compile(r'\bsha256sum\b'),
+    re.compile(r'\bmd5sum\b'),
+    re.compile(r'\bsha1sum\b'),
+    re.compile(r'\bsha512sum\b'),
+    re.compile(r'find\b.*-mmin\b'),
+    re.compile(r'find\b.*-mtime\b'),
+    re.compile(r'find\b.*-newer\b'),
+]
+
+
+def is_blacklisted_command(cmd: str) -> bool:
+    """Return True if the command matches a known fingerprinting/cheating pattern."""
+    for pattern in _BLACKLISTED_PATTERNS:
+        if pattern.search(cmd):
+            return True
+    return False

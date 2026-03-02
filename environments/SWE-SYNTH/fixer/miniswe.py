@@ -14,7 +14,7 @@ from typing import Optional
 import yaml
 
 from .base import BaseFixerAgent, FixerConfig, FixerResult
-from utils import SANITIZE_GIT_SCRIPT
+from utils import SANITIZE_GIT_SCRIPT, NORMALIZE_TIMESTAMPS_SCRIPT, is_blacklisted_command
 
 
 def _strip_thinking_tags(content: str) -> str:
@@ -32,6 +32,22 @@ def _strip_thinking_tags(content: str) -> str:
 # Suppress verbose logging from minisweagent
 logging.getLogger("minisweagent").setLevel(logging.WARNING)
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+
+
+class _BlacklistDockerEnv:
+    """Wraps DockerEnvironment to block blacklisted fingerprinting commands."""
+
+    def __init__(self, env):
+        self._env = env
+
+    def execute(self, command, **kwargs):
+        if is_blacklisted_command(str(command)):
+            print(f"[SWE-SYNTH] Blocked blacklisted command: {str(command)[:200]}")
+            return {"stdout": "Command not permitted in this environment.", "output": "Command not permitted in this environment.", "returncode": 1}
+        return self._env.execute(command, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._env, name)
 
 
 class MiniSWEFixerAgent(BaseFixerAgent):
@@ -109,6 +125,12 @@ class MiniSWEFixerAgent(BaseFixerAgent):
 
         # Sanitize git history to prevent cheating via git log/show
         self._sanitize_git_history()
+
+        # Normalize timestamps to prevent fingerprinting via mtime
+        try:
+            self._env.execute(NORMALIZE_TIMESTAMPS_SCRIPT, timeout=60)
+        except Exception as e:
+            print(f"[SWE-SYNTH] Warning: Failed to normalize timestamps: {e}")
 
         # Verify code state after patches
         git_status_raw = self._env.execute("cd /app && git status --porcelain", timeout=30)
@@ -220,7 +242,8 @@ class MiniSWEFixerAgent(BaseFixerAgent):
             agent_config["cost_limit"] = self.config.cost_limit
 
             # Run agent (use ThinkingAwareAgent to handle <think> tags)
-            self._agent = ThinkingAwareAgent(model_obj, self._env, **agent_config)
+            # Wrap env to block blacklisted fingerprinting commands
+            self._agent = ThinkingAwareAgent(model_obj, _BlacklistDockerEnv(self._env), **agent_config)
             patch = ""
             error = None
 
