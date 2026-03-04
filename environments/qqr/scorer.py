@@ -11,11 +11,13 @@ Score structure (max 100, 50/50 code-LLM split):
   - Code verifies "data presence" — fact matching, overlap ratios
   - tool_quality soft HC gates on coverage/validity ratios
 - Fabrication penalty: 0 to -12.5 (deducted from code score)
-- LLM score (50): practicality(12.5), logic(12.5), user_experience(12.5), analysis_depth(12.5)
+- LLM score (50): Quality(40) + Grounding(10)
+  - Quality: practicality(10), logic(10), user_experience(10), analysis_depth(10)
+  - Grounding: factual_grounding(10) — semantic-level fact checking via LLM
   - LLM evaluates "reasoning quality" — logic, feasibility, depth of analysis
   - analysis_depth specifically penalizes data-dumping (copying tool data without reasoning)
   - Smooth LLM-code coupling: llm *= min(1.0, code / (max_code * 0.6))
-  - Replaces cliff-edge cap for better RL gradient
+  - Defense-in-depth: min(regex_mult, llm_grounding_mult) when severe fabrication detected
 
 Anti-hack measures:
 1. Grounded completeness: _check_with_grounded_context requires tool fact presence
@@ -32,8 +34,10 @@ Anti-hack measures:
 4. Transport grounding: graduated penalty (0.3x at 100% fabrication)
 5. Epoch salt: weekly rotation of transport data prevents memorization
 6. Tool quality gate: <50% coverage OR validity → 0.5x score multiplier
-7. tool_info_used gate: IC≥6 AND Comp≥6 for transport, IC≥2.5 AND Comp≥2.5 for others
-   - Non-transport tool_info_used fail: 0.1x softened (not 0.0 hard kill)
+7. tool_info_used gate: IC≥6 for transport, IC≥8 for others (IC-only, not Comp)
+   - Determined from pre-local_fab IC (tool data presence, not fabrication)
+   - Comp excluded: content coverage ≠ tool usage; already in geometric mean
+   - Non-transport tool_info_used fail: 0.05x softened (not 0.0 hard kill)
 """
 
 import re
@@ -59,9 +63,7 @@ from config import (
     INFO_CONSISTENCY_MIN_BREADTH_TOTAL,
     LLM_CODE_RATIO_FACTOR,
     CODE_TOOL_USED_IC_THRESHOLD,
-    CODE_TOOL_USED_COMP_THRESHOLD,
     CODE_TOOL_USED_IC_THRESHOLD_NONTRANSPORT,
-    CODE_TOOL_USED_COMP_THRESHOLD_NONTRANSPORT,
     IC_MIN_QUANTITY_THRESHOLD,
     IC_MIN_QUANTITY_RATIO,
     IC_MIN_QUANTITY_CAP,
@@ -149,6 +151,7 @@ class ScoreBreakdown:
     llm_analysis_depth: float = 0.0
     llm_logic: float = 0.0
     llm_user_experience: float = 0.0
+    llm_factual_grounding: float = 0.0
 
     llm_reasons: Dict[str, str] = field(default_factory=dict)
     llm_tool_usage_reason: str = ""
@@ -243,7 +246,8 @@ class ScoreBreakdown:
             self.llm_practicality +
             self.llm_analysis_depth +
             self.llm_logic +
-            self.llm_user_experience, 2
+            self.llm_user_experience +
+            self.llm_factual_grounding, 2
         )
 
     def _coupled_llm_total(self) -> float:
@@ -271,6 +275,7 @@ class ScoreBreakdown:
                 "analysis_depth": self.llm_analysis_depth,
                 "logic": self.llm_logic,
                 "user_experience": self.llm_user_experience,
+                "factual_grounding": self.llm_factual_grounding,
                 "subtotal": self.llm_total,
                 "coupled_subtotal": self._coupled_llm_total(),
                 "reasons": self.llm_reasons,
@@ -836,18 +841,21 @@ class TransportGroundingVerifier:
         called_tools: Set[str],
         problem_type: str
     ) -> float:
-        """Detect fabricated local transport claims in non-transport problem types.
+        """Detect fabricated local transport claims (distance/time) in non-transport types.
 
         Only applies when:
         1. Problem type is NOT in REQUIRES_TRANSPORT (e.g., food_tour, multiday)
         2. 'direction' tool was never called
 
-        Scans output for specific distance/time claims that imply route knowledge
-        the model couldn't have (no direction tool was called).
+        Scans output for distance/time claims that imply route knowledge the model
+        couldn't have (no direction tool was called). Only decays IC (data accuracy).
 
-        Returns multiplier [0.5, 1.0]:
+        Price fabrication is NOT checked here — it's handled by IC price category,
+        ClaimVerifier.verify_claims, and Comp budget/cost checks (3 separate layers).
+
+        Returns multiplier [0.4, 1.0]:
         - 1.0 = no fabrication detected
-        - 0.5 = heavy fabrication (>=5 ungrounded claims)
+        - Lower = more fabricated distance/time claims
         """
         # Only check non-transport types where direction was not called
         if problem_type in REQUIRES_TRANSPORT:
@@ -856,28 +864,62 @@ class TransportGroundingVerifier:
             return 1.0
 
         # Patterns for specific distance/time claims (not vague "附近")
+        # +单程, +往返 for distance
         distance_claim_pattern = re.compile(
-            r'(?:距离|相距|路程|全程)[约大概]*\s*(\d+(?:\.\d+)?)\s*(公里|km|千米|米)',
+            r'(?:距离|相距|路程|全程|单程|往返)[约大概]*\s*(\d+(?:\.\d+)?)\s*(公里|km|千米|米)',
             re.IGNORECASE
         )
+        # Broad time claim detection with comprehensive transit prefixes
+        # Covers: 约15分钟, 大概20分钟, 车程约10分钟, 预计45分钟, 耗时30分钟,
+        #         路程需1小时, 仅需10分钟, etc.
+        # [需约大概]* after prefix absorbs connecting words (e.g., 路程+需+1小时)
         time_claim_pattern = re.compile(
-            r'(?:打车|驾车|开车|乘车|坐车|步行|骑行|公交|地铁|出租车)[约大概]*\s*(\d+)\s*(分钟|小时|min)',
+            r'(?:打车|驾车|开车|乘车|坐车|步行|骑行|公交|地铁|出租车|'
+            r'耗时|用时|需要?|约需?|大约需?|大概需?|预计需?|仅需|'
+            r'车程|路程|全程|约|大概|预计)'
+            r'[需约大概]*\s*(\d+)(?:\s*[-~至到]\s*\d+)?\s*(分钟|小时|min)',
             re.IGNORECASE
         )
 
-        # Count ungrounded claims
+        # Count ungrounded transport claims (distance + time only).
+        # Price fabrication is NOT checked here — it's already handled by:
+        #   1. IC price category (overlap check against tool prices)
+        #   2. ClaimVerifier.verify_claims (fabrication_penalty for mismatches)
+        #   3. Comp budget/cost checks (no tool price data → 0 credit)
         distance_claims = distance_claim_pattern.findall(output_text)
         time_claims = time_claim_pattern.findall(output_text)
+
         total_claims = len(distance_claims) + len(time_claims)
 
         if total_claims == 0:
             return 1.0
-        elif total_claims >= 5:
-            return 0.5
-        elif total_claims >= 3:
-            return 0.65
+
+        # Type-aware penalty: softer when direction is should_call (not must_call).
+        # food_tour/multiday/family_study legitimately mention walking times and
+        # approximate distances as normal narration, not fabrication.
+        tiers = TOOL_TIERS_BY_TYPE.get(problem_type, {})
+        direction_is_should_call = "direction" in tiers.get("should_call", set())
+
+        if direction_is_should_call:
+            # Softer scale: casual distance/time mentions are expected narration
+            if total_claims <= 3:
+                return 0.95
+            elif total_claims <= 6:
+                return 0.85
+            elif total_claims <= 10:
+                return 0.75
+            else:
+                return 0.65
         else:
-            return 0.8
+            # Original strict scale
+            if total_claims <= 2:
+                return 0.85
+            elif total_claims <= 4:
+                return 0.7
+            elif total_claims <= 7:
+                return 0.55
+            else:
+                return 0.4
 
 
 # ============================================================================
@@ -1073,7 +1115,7 @@ class HardConstraintChecker:
 
     def _check_format(self, parsed: ParsedOutput, problem: TravelProblem) -> bool:
         """Check output format based on problem type."""
-        if not parsed.raw_text or len(parsed.raw_text.strip()) < 100:
+        if not parsed.raw_text or len(parsed.raw_text.strip()) < FORMAT_MIN_LENGTH:
             return False
 
         if problem.problem_type == "intercity":
@@ -1149,7 +1191,8 @@ class TravelScorer:
         self._parser = get_parser()
         self._hard_checker = HardConstraintChecker()
         self._claim_verifier = ClaimVerifier()
-        self._llm_validator = llm_validator
+        # Accept either LLMEvaluator (new) or LLMValidator (legacy) — both stored here
+        self._llm_evaluator = llm_validator
 
     async def score(
         self,
@@ -1202,13 +1245,23 @@ class TravelScorer:
         local_fab = TransportGroundingVerifier.verify_local_transport_claims(
             raw_output, tool_facts, called_tools, problem.problem_type
         )
+
+        # Save pre-local_fab IC for tool_info_used determination.
+        # tool_info_used = "did the model reference tool data?" — independent of
+        # whether it also fabricated local transport claims.
+        pre_fab_ic = result.info_consistency
+
         if local_fab < 1.0:
-            result.completeness *= local_fab
+            # Only decay IC (data accuracy), not Comp (content coverage).
+            # Fabricated distances/times are a data accuracy problem — Comp
+            # measures whether content areas were covered, not whether specifics
+            # are accurate. Low Comp is already reflected in geometric mean.
             result.info_consistency *= local_fab
 
-        # 2. Code-determined tool_info_used (epoch-salted fact overlap, not forgeable)
+        # 2. Code-determined tool_info_used (IC-only, epoch-salted fact overlap)
+        # Determined from pre-local_fab IC (tool data presence, not fabrication)
         result.hard_constraints["tool_info_used"] = self._determine_tool_info_used(
-            result.info_consistency, result.completeness, problem
+            pre_fab_ic, problem
         )
         result.tool_info_override = "code_determined"
 
@@ -1231,23 +1284,42 @@ class TravelScorer:
 
         result.fabrication_penalty = max(FABRICATION_PENALTY_MAX, penalty)
 
-        # 4. LLM validation (optional enhancement, not a gate)
-        if self._llm_validator:
-            llm_result = await self._llm_validator.validate(
-                raw_output, problem, tool_trace
-            )
+        # 4. LLM evaluation (optional enhancement, not a gate)
+        if self._llm_evaluator:
+            eval_context = {
+                "problem": problem,
+                "model_output": raw_output,
+                "tool_trace": tool_trace,
+                "tool_facts": tool_facts,
+                "output_facts": output_facts,
+                "called_tools": called_tools,
+            }
+            llm_result = await self._llm_evaluator.evaluate(eval_context)
             result.llm_validation_success = llm_result.success
             result.llm_validation_error = llm_result.error
-            result.llm_tool_usage_reason = llm_result.tool_usage_reason
-            if llm_result.success:
+
+            if llm_result.quality_success:
                 result.llm_practicality = llm_result.practicality * LLM_SCORE_WEIGHTS["practicality"] / 10.0
                 result.llm_analysis_depth = llm_result.analysis_depth * LLM_SCORE_WEIGHTS["analysis_depth"] / 10.0
                 result.llm_logic = llm_result.logic * LLM_SCORE_WEIGHTS["logic"] / 10.0
                 result.llm_user_experience = llm_result.user_experience * LLM_SCORE_WEIGHTS["user_experience"] / 10.0
-                result.llm_reasons = llm_result.reasons
-            # LLM failure: llm_total=0, code 70 pts still valid
+                result.llm_reasons = llm_result.quality_reasons
+
+            if llm_result.grounding_success:
+                result.llm_factual_grounding = llm_result.factual_grounding * LLM_SCORE_WEIGHTS["factual_grounding"] / 10.0
+
+            # Defense-in-depth: when LLM grounding detects severe fabrication (<4/10)
+            # and regex missed it, supplement code score penalty
+            if llm_result.grounding_success and llm_result.factual_grounding < 4.0:
+                llm_grounding_mult = 0.3 + 0.7 * (llm_result.factual_grounding / 4.0)
+                combined = min(local_fab, llm_grounding_mult)
+                if combined < local_fab:
+                    result.completeness *= (combined / max(local_fab, 0.01))
+                    result.info_consistency *= (combined / max(local_fab, 0.01))
+
+            # LLM failure: llm_total=0, code still valid
         else:
-            result.llm_validation_error = "LLM validator not configured"
+            result.llm_validation_error = "LLM evaluator not configured"
 
         return result
 
@@ -1280,25 +1352,27 @@ class TravelScorer:
         return valid_calls / total_calls if total_calls > 0 else 0.0
 
     def _determine_tool_info_used(
-        self, ic: float, comp: float, problem: TravelProblem
+        self, ic: float, problem: TravelProblem
     ) -> bool:
-        """Determine tool_info_used purely from code scores.
+        """Determine tool_info_used from IC score only.
+
+        IC directly measures "did the model reference tool-provided facts?"
+        (epoch-salted POI names, flight IDs, weather data — not forgeable).
+
+        Comp measures content coverage quality, NOT tool usage — a model can
+        have perfect IC (used all tool data) but low Comp (missed some content
+        patterns). Penalizing via tool_info_used gate would be double-jeopardy
+        since Comp is already reflected in the geometric mean score.
 
         Transport types (intercity, hybrid, business) have more verifiable
-        categories (flights, trains) so use higher thresholds.
-        Non-transport types have fewer verifiable categories so use lower thresholds.
+        categories (flights, trains) so use lower thresholds.
+        Non-transport types have fewer verifiable categories so use higher thresholds.
         """
         transport_types = {"intercity", "hybrid", "business"}
         if problem.problem_type in transport_types:
-            return (
-                ic >= CODE_TOOL_USED_IC_THRESHOLD
-                and comp >= CODE_TOOL_USED_COMP_THRESHOLD
-            )
+            return ic >= CODE_TOOL_USED_IC_THRESHOLD
         else:
-            return (
-                ic >= CODE_TOOL_USED_IC_THRESHOLD_NONTRANSPORT
-                and comp >= CODE_TOOL_USED_COMP_THRESHOLD_NONTRANSPORT
-            )
+            return ic >= CODE_TOOL_USED_IC_THRESHOLD_NONTRANSPORT
 
     def _compute_tool_diversity_multiplier(
         self, tool_trace: List[Dict], problem: 'TravelProblem'

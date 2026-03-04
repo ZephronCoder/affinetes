@@ -20,7 +20,11 @@ from .env import Actor
 from .problem_generator import ProblemGenerator, TravelProblem, get_generator
 from .parser import OutputParser, ParsedOutput, get_parser
 from .scorer import TravelScorer, ScoreBreakdown
-from .llm_validator import LLMValidator, LLMValidationResult, get_llm_validator
+from .llm_validator import LLMEvaluator, LLMEvaluationResult, get_llm_evaluator
+# Backward compat
+LLMValidator = LLMEvaluator
+LLMValidationResult = LLMEvaluationResult
+get_llm_validator = get_llm_evaluator
 
 __all__ = [
     "Actor",
@@ -32,6 +36,9 @@ __all__ = [
     "get_parser",
     "TravelScorer",
     "ScoreBreakdown",
+    "LLMEvaluator",
+    "LLMEvaluationResult",
+    "get_llm_evaluator",
     "LLMValidator",
     "LLMValidationResult",
     "get_llm_validator",

@@ -49,7 +49,7 @@ from config import (
 )
 from problem_generator import TravelProblem, get_generator
 from scorer import TravelScorer
-from llm_validator import LLMValidator
+from llm_validator import get_llm_evaluator
 
 from affinetes.core.openenv import OpenEnvResponse
 
@@ -177,12 +177,19 @@ class StepRewardCalculator:
             if tool_name in {"search_flights", "search_train_tickets"}:
                 score += 0.2
 
-        # Late-stage diversity penalty: after step 5, if repeating a tool
-        # while required tools remain uncalled, penalize to encourage exploration
-        if step_number > 5 and tool_name in called_tools_so_far:
+        # Diversity penalty: penalize repeating a tool to discourage
+        # redundant calls (e.g., 12x poi_search instead of direction/around)
+        if step_number > 3 and tool_name in called_tools_so_far:
             uncalled_required = required - called_tools_so_far - {tool_name}
             if uncalled_required:
-                score -= 0.15
+                # Strong penalty: required tools still uncalled
+                base_penalty = 0.30
+                escalation = 0.05 * max(0, step_number - 5)
+                score -= min(0.50, base_penalty + escalation)
+            elif step_number > 6:
+                # Diminishing returns: all required tools called but still
+                # repeating at late stage — mild escalating penalty
+                score -= min(0.20, 0.05 * (step_number - 6))
 
         return max(0.0, min(1.0, score))
 
@@ -306,18 +313,12 @@ class Actor:
         self._eval_count = 0
         self._gc_interval = 20
 
-        # LLM Validator with fallback models
-        self._llm_validator = None
+        # LLM Evaluator with scorer groups (quality + grounding)
+        self._llm_evaluator = None
         if enable_llm_validator:
-            api_key = os.getenv("CHUTES_API_KEY")
-            if api_key:
-                self._llm_validator = LLMValidator(
-                    model=llm_validator_model,
-                    base_url="https://llm.chutes.ai/v1",
-                    api_key=api_key,
-                )
+            self._llm_evaluator = get_llm_evaluator()
 
-        self._scorer = TravelScorer(llm_validator=self._llm_validator)
+        self._scorer = TravelScorer(llm_validator=self._llm_evaluator)
 
     async def _ensure_mcp_initialized(self):
         """Ensure MCP servers are initialized."""
@@ -477,7 +478,7 @@ class Actor:
                 tool_results.append({
                     "tool": name,
                     "call_id": call_id,
-                    "result": self._truncate_tool_result(result_content, max_chars=2000),
+                    "result": self._truncate_tool_result(result_content, max_chars=3000),
                 })
 
             # Combine all tool results into one user message (Chutes API workaround)
@@ -585,17 +586,14 @@ class Actor:
         task_id = task_id if task_id is not None else (seed & 0x7FFFFFFF)
         api_key = api_key or os.getenv("CHUTES_API_KEY")
 
-        # Lazy-init LLM validator when api_key arrives via evaluate() param
-        if api_key and not self._llm_validator:
+        # Lazy-init LLM evaluator when api_key arrives via evaluate() param
+        if api_key and not self._llm_evaluator:
             async with self._init_lock:
                 # Double-check after acquiring lock
-                if not self._llm_validator:
-                    self._llm_validator = LLMValidator(
-                        model=self._llm_validator_model,
-                        base_url="https://llm.chutes.ai/v1",
-                        api_key=api_key,
-                    )
-                    self._scorer = TravelScorer(llm_validator=self._llm_validator)
+                if not self._llm_evaluator:
+                    self._llm_evaluator = get_llm_evaluator(api_key=api_key)
+                    if self._llm_evaluator:
+                        self._scorer = TravelScorer(llm_validator=self._llm_evaluator)
 
         episode_id = None  # guard: ensure defined before try/finally
         async with self._eval_semaphore:
@@ -804,6 +802,20 @@ class Actor:
             if cut < max_chars // 2:
                 cut = max_chars
             return content[:cut] + f"\n... (truncated, {len(content)} chars total)"
+
+        # MCP TextContent: {"type":"text","text":"...","annotations":null,"meta":null}
+        # Extract the "text" field's actual content, then truncate as plain text
+        # (same logic as scorer._get_result_string for consistency)
+        if (isinstance(data, dict)
+                and data.get("type") == "text"
+                and isinstance(data.get("text"), str)):
+            inner_text = data["text"]
+            if len(inner_text) <= max_chars:
+                return inner_text
+            cut = inner_text[:max_chars].rfind('\n')
+            if cut < max_chars // 2:
+                cut = max_chars
+            return inner_text[:cut] + f"\n... (truncated, {len(inner_text)} chars total)"
 
         if isinstance(data, list):
             # Keep complete items that fit within budget

@@ -274,16 +274,33 @@ LLM_RUBRIC_PENALTY_RANGES = {
     "backtracking": (1, 3),
     "no_order_reason": (1, 3),
     "bad_geography": (3, 5),
+    # Grounding rubric penalties (used by GroundingScorer prompt)
+    "ungrounded_transport": (3, 5),
+    "ungrounded_time_distance": (2, 4),
+    "fabricated_price": (2, 4),
+    "ungrounded_poi": (1, 3),
 }
 
-# LLM score weights (max 50) - elevated to 50/50 split for anti-hack
-# "analysis_depth" replaces "informativeness" to penalize data-dumping
+# LLM score weights (max 50) - 5 dimensions × 10 points each
+# Round 3: added factual_grounding for semantic-level fact checking
 LLM_SCORE_WEIGHTS = {
-    "practicality": 12.5,
-    "logic": 12.5,
-    "user_experience": 12.5,
-    "analysis_depth": 12.5,
+    "practicality": 10.0,
+    "logic": 10.0,
+    "user_experience": 10.0,
+    "analysis_depth": 10.0,
+    "factual_grounding": 10.0,
 }
+
+# Unified LLM evaluation model list (single call for all 5 dimensions)
+LLM_MODELS = [
+    "openai/gpt-oss-120b-TEE",
+    "Qwen/Qwen3-235B-A22B-Instruct-2507-TEE",
+    "Qwen/Qwen2.5-72B-Instruct",
+    "Qwen/Qwen3-32B",
+]
+# Backward compat aliases
+LLM_QUALITY_MODELS = LLM_MODELS
+LLM_GROUNDING_MODELS = LLM_MODELS
 
 # Total scores
 TOTAL_CODE_SCORE = sum(CODE_SCORE_WEIGHTS.values())
