@@ -767,6 +767,8 @@ fi
             "--rm",
             "--init",
             "--stop-timeout", "10",
+            "--memory", "4g",
+            "--memory-swap", "6g",
             "--network=host",
             "--entrypoint", "",
             docker_image,
