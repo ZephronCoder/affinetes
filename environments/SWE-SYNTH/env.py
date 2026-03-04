@@ -517,7 +517,7 @@ fi
 
             print(f"Running verification container (timeout={VERIFY_FIX_TIMEOUT}s)...")
             result = subprocess.run(
-                ["docker", "run", "--rm", "-i", "--entrypoint", "/bin/bash", image],
+                ["docker", "run", "--rm", "-i", "--network=host", "--entrypoint", "/bin/bash", image],
                 input=full_script,
                 capture_output=True,
                 timeout=VERIFY_FIX_TIMEOUT,
@@ -661,7 +661,7 @@ fi
 
             print(f"Running expansion verification container (timeout={VERIFY_FIX_TIMEOUT}s)...")
             result = subprocess.run(
-                ["docker", "run", "--rm", "-i", "--entrypoint", "/bin/bash", docker_image],
+                ["docker", "run", "--rm", "-i", "--network=host", "--entrypoint", "/bin/bash", docker_image],
                 input=full_script,
                 capture_output=True,
                 timeout=VERIFY_FIX_TIMEOUT,
@@ -749,6 +749,7 @@ fi
             "--name", container_name,
             "-w", "/app",
             "--rm",
+            "--network=host",
             "--entrypoint", "",
             docker_image,
             "sleep", "7200",  # 2 hours max
