@@ -87,8 +87,18 @@ class BaseFixerAgent(ABC):
         )
         print(f"[SWE-SYNTH] Git history sanitized: {result.stdout[:200]}")
 
+        # Warm up the login shell so conda activation and .pyc compilation happen
+        # before normalization. The agent runs commands via "bash -lc", which sources
+        # /etc/profile.d scripts and activates the conda env, potentially creating
+        # __pycache__/*.pyc files with current timestamps. Running a login shell here
+        # ensures those files exist before we normalize.
         subprocess.run(
-            ["docker", "exec", self._container_name, "bash", "-c", NORMALIZE_TIMESTAMPS_SCRIPT],
+            ["docker", "exec", self._container_name, "bash", "-lc", "true"],
+            capture_output=True, text=True, timeout=60,
+        )
+
+        subprocess.run(
+            ["docker", "exec", self._container_name, "bash", "-lc", NORMALIZE_TIMESTAMPS_SCRIPT],
             capture_output=True, text=True, timeout=120,
         )
         print("[SWE-SYNTH] Timestamps normalized")
